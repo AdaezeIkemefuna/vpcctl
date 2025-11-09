@@ -119,6 +119,11 @@ class VPC:
             return False
         
         try:
+            for subnet_name, subnet_data in state['subnets'].items(): #incase there is existing subnets, delete it with the veths connected
+                log('INFO', f"Deleting subnet: {subnet_name}")
+                run_cmd(['ip', 'netns', 'del', subnet_data['namespace']], check=False)
+                run_cmd(['ip', 'link', 'del', subnet_data['veth_br']], check=False)
+
             log('INFO', f"Deleting bridge: {state['bridge']}")
             run_cmd(['ip', 'link', 'del', state['bridge']], check=False)
             
@@ -130,7 +135,89 @@ class VPC:
         except Exception as e:
             log('ERROR', f"Failed to delete VPC: {e}")
             return False
-    
+
+    def subnet_add(self, subnet_name, subnet_cidr):
+        log('INFO', f"Adding subnet {subnet_name} ({subnet_cidr}) to VPC {self.name}")
+
+        state = self.state_manager.load(self.name)
+        if not state:
+            log('ERROR', f"VPC {self.name} does not exist")
+            return False
+        
+        if subnet_name in state['subnets']:
+            log('ERROR', f"Subnet {subnet_name} already exists in VPC {self.name}")
+            return False
+
+        try:
+            ns_name = f"ns-{self.name}-{subnet_name}"
+            veth_br = f"veth-{subnet_name}-br"
+            veth_ns = f"veth-{subnet_name}-ns"
+
+            #Create namespace
+            log('INFO', f"Creating namespace: {ns_name}")
+            run_cmd(['ip', 'netns', 'add', ns_name])
+
+            #Create veth pair
+            log('INFO', f"Creating veth pair: {veth_br} <-> {veth_ns}")
+            run_cmd(['ip', 'link', 'add', veth_br, 'type', 'veth', 'peer', 'name', veth_ns])
+            
+            log('INFO', f"Moving {veth_ns} to namespace {ns_name}")
+            run_cmd(['ip', 'link', 'set', veth_ns, 'netns', ns_name])
+            
+            log('INFO', f"Attaching {veth_br} to bridge {state['bridge']}")
+            run_cmd(['ip', 'link', 'set', veth_br, 'master', state['bridge']])
+            run_cmd(['ip', 'link', 'set', veth_br, 'up'])
+            
+            # Configure namespace interface
+            subnet_ip = self._get_subnet_ip(subnet_cidr)
+            subnet_prefix = subnet_cidr.split('/')[1]
+
+            log('INFO', f"Configuring interface in namespace with IP {subnet_ip}")
+            run_cmd(['ip', 'netns', 'exec', ns_name, 'ip', 'addr', 'add', 
+                    f"{subnet_ip}/{subnet_prefix}", 'dev', veth_ns])
+            run_cmd(['ip', 'netns', 'exec', ns_name, 'ip', 'link', 'set', veth_ns, 'up'])
+            run_cmd(['ip', 'netns', 'exec', ns_name, 'ip', 'link', 'set', 'lo', 'up'])
+
+            log('INFO', f"Adding default route via {state['gateway_ip']}")
+            run_cmd(['ip', 'netns', 'exec', ns_name, 'ip', 'route', 'add', 
+                    'default', 'via', state['gateway_ip']])
+
+            # Update state
+            state['subnets'][subnet_name] = {
+                'cidr': subnet_cidr,
+                'namespace': ns_name,
+                'veth_br': veth_br,
+                'veth_ns': veth_ns,
+                'ip': subnet_ip
+            }
+
+            self.state_manager.save(self.name, state)
+            
+            log('SUCCESS', f"Subnet {subnet_name} added to VPC {self.name}")
+            log('INFO', f"  Namespace: {ns_name}")
+            log('INFO', f"  Gateway: {subnet_gateway}")
+            
+            return True
+
+        except Exception as e:
+            log('ERROR', f"Failed to add subnet: {e}")
+            # Cleanup on failure
+            run_cmd(['ip', 'netns', 'del', ns_name], check=False)
+            run_cmd(['ip', 'link', 'del', veth_br], check=False)
+            return False
+
+    def _get_subnet_gateway(self, subnet_cidr):
+        """Get first usable IP in subnet"""
+        parts = subnet_cidr.split('/')[0].split('.')
+        parts[-1] = '1'
+        return '.'.join(parts)
+
+    def _get_subnet_ip(self, subnet_cidr):
+        """Get .2 IP in subnet (.1 reserved for gateway concept)"""
+        parts = subnet_cidr.split('/')[0].split('.')
+        parts[-1] = '2'
+        return '.'.join(parts)   
+        
     def _get_gateway_ip(self):
         parts = self.cidr.split('/')[0].split('.')
         parts[-1] = '1'
@@ -204,6 +291,11 @@ def main():
     
     show_parser = subparsers.add_parser('show', help='Show VPC details')
     show_parser.add_argument('name', help='VPC name')
+
+    subnet_add_parser = subparsers.add_parser('subnet-add', help='Add subnet to VPC')
+    subnet_add_parser.add_argument('vpc_name', help='VPC name')
+    subnet_add_parser.add_argument('subnet_name', help='Subnet name (e.g., public, private)')
+    subnet_add_parser.add_argument('subnet_cidr', help='Subnet CIDR (e.g., 10.0.1.0/24)')
     
     args = parser.parse_args()
     
@@ -227,6 +319,11 @@ def main():
         
         elif args.command == 'show':
             VPC.show(args.name)
+
+        elif args.command == 'subnet-add':
+            vpc = VPC(args.vpc_name, '')
+            success = vpc.subnet_add(args.subnet_name, args.subnet_cidr)
+            sys.exit(0 if success else 1)
         
     except KeyboardInterrupt:
         print("\n\nOperation cancelled")
