@@ -17,14 +17,14 @@ cd vpcctl
 ### Quick run (from repo directory)
 
 ```bash
-sudo python3 ./vpcctl create my-vpc 10.0.0.0/16
+sudo python3 ./vpcctl.sh create my-vpc 10.0.0.0/16
 ```
 
 ### Recommended: Install system-wide
 
 ```bash
 # Copy script to system binaries
-sudo cp vpcctl /usr/local/bin/vpcctl
+sudo cp vpcctl.sh /usr/local/bin/vpcctl
 sudo chmod +x /usr/local/bin/vpcctl
 
 # Create state directory
