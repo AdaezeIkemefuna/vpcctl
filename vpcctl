@@ -171,9 +171,15 @@ class VPC:
                 run_cmd(['ip', 'netns', 'del', subnet_data['namespace']], check=False)
                 run_cmd(['ip', 'link', 'del', subnet_data['veth_br']], check=False)
 
+            # Remove bridge forwarding rule
+            log('INFO', f"Removing bridge forwarding rules")
+            run_cmd(['iptables', '-D', 'FORWARD', '-i', state['bridge'], 
+                    '-o', state['bridge'], '-j', 'ACCEPT'], check=False)
+            
             # Delete the bridge
             log('INFO', f"Deleting bridge: {state['bridge']}")
             run_cmd(['ip', 'link', 'del', state['bridge']], check=False)
+            
             
             # Remove state
             self.state_manager.delete(self.name)
@@ -257,6 +263,13 @@ class VPC:
                     f"{namespace_ip}/{subnet_prefix}", 'dev', veth_ns])
             run_cmd(['ip', 'netns', 'exec', ns_name, 'ip', 'link', 'set', veth_ns, 'up'])
             run_cmd(['ip', 'netns', 'exec', ns_name, 'ip', 'link', 'set', 'lo', 'up'])
+            
+            log('INFO', "Configuring DNS")
+            resolv_conf_path = f"/etc/netns/{ns_name}"
+            run_cmd(['mkdir', '-p', resolv_conf_path], check=False)
+            with open(f"{resolv_conf_path}/resolv.conf", 'w') as f:
+                f.write("nameserver 8.8.8.8\n")
+                f.write("nameserver 8.8.4.4\n")
 
             # Add default route - now the gateway is in the same subnet
             log('INFO', f"Adding default route via {gateway_ip}")
@@ -266,6 +279,8 @@ class VPC:
             # Enable IP forwarding on the host (if not already enabled)
             log('INFO', "Enabling IP forwarding")
             run_cmd(['sysctl', '-w', 'net.ipv4.ip_forward=1'], check=False)
+            
+            self._enable_bridge_forwarding()
 
             if subnet_type == 'public':
                 log('INFO', f"Configuring NAT for public subnet")
@@ -348,6 +363,13 @@ class VPC:
         except:
             pass
         return None
+    def _enable_bridge_forwarding(self):
+        """Enable forwarding between subnets on the bridge"""
+        log('INFO', f"Enabling inter-subnet forwarding on {self.bridge_name}")
+        
+        # Allow forwarding within the bridge (subnet to subnet)
+        run_cmd(['iptables', '-A', 'FORWARD', '-i', self.bridge_name, 
+                '-o', self.bridge_name, '-j', 'ACCEPT'], check=False)
     
     @staticmethod
     def list_all():
