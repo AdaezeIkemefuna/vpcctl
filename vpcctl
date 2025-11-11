@@ -9,6 +9,7 @@ import os
 import argparse
 from pathlib import Path
 import ipaddress
+import hashlib
 
 from vpcctl_lib.state import StateManager, log, Colors
 from vpcctl_lib.policy import PolicyManager
@@ -265,14 +266,15 @@ class VPC:
                 return False
 
         try:
+            subnet_hash = hashlib.md5(f"{self.name}-{subnet_name}".encode()).hexdigest()[:4]
             ns_name = f"ns-{self.name}-{subnet_name}"
-            veth_br = f"v-{self.name}-{subnet_name[:3]}-br"  
-            veth_ns = f"v-{self.name}-{subnet_name[:3]}-ns"  
+            veth_br = f"vb{subnet_hash}"  
+            veth_ns = f"vn{subnet_hash}" 
 
             # Get gateway IP (first usable IP in subnet)
             subnet_net = ipaddress.ip_network(subnet_cidr)
-            gateway_ip = str(list(subnet_net.hosts())[0])  # First usable IP
-            namespace_ip = str(list(subnet_net.hosts())[1])  # Second usable IP
+            gateway_ip = str(list(subnet_net.hosts())[0])  
+            namespace_ip = str(list(subnet_net.hosts())[1])  
             subnet_prefix = subnet_cidr.split('/')[1]
 
             # Add gateway IP to the bridge for this subnet
