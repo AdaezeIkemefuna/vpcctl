@@ -13,6 +13,8 @@ import ipaddress
 from vpcctl_lib.state import StateManager, log, Colors
 from vpcctl_lib.policy import PolicyManager
 from vpcctl_lib.peering import PeeringManager
+from vpcctl_lib.validators import Validators
+from vpcctl_lib.cleanup import CleanupManager
 
 STATE_DIR = Path("/var/lib/vpcctl")
 
@@ -87,6 +89,12 @@ class VPC:
         self.state_manager = StateManager()
     
     def create(self):
+        if not Validators.validate_vpc_name(self.name):
+            return False
+    
+        if not Validators.validate_cidr(self.cidr):
+            return False
+        
         log('INFO', f"Creating VPC: {self.name} ({self.cidr})")
         
         if self.state_manager.exists(self.name):
@@ -199,6 +207,8 @@ class VPC:
             run_cmd(['ip', 'link', 'del', state['bridge']], check=False)
             
             
+            CleanupManager.verify_cleanup(self.name, state)
+            
             self.state_manager.delete(self.name)
             
             log('SUCCESS', f"VPC {self.name} deleted successfully!")
@@ -206,9 +216,18 @@ class VPC:
             
         except Exception as e:
             log('ERROR', f"Failed to delete VPC: {e}")
+            log('WARNING', "Attempting force cleanup...")
+            CleanupManager.force_cleanup(self.name, state)
+            self.state_manager.delete(self.name)
             return False
 
     def subnet_add(self, subnet_name, subnet_cidr, subnet_type='private'):
+        if not Validators.validate_subnet_name(subnet_name):
+            return False
+        
+        if not Validators.validate_cidr(subnet_cidr):
+            return False
+        
         log('INFO', f"Adding subnet {subnet_name} ({subnet_cidr}) to VPC {self.name}")
 
         state = self.state_manager.load(self.name)
@@ -220,6 +239,12 @@ class VPC:
             log('ERROR', f"Subnet {subnet_name} already exists in VPC {self.name}")
             return False
 
+        if not Validators.validate_subnet_within_vpc(state['cidr'], subnet_cidr):
+            return False
+        
+        if not Validators.check_subnet_overlap(state['subnets'], subnet_cidr):
+            return False
+    
         # Validate that subnet is within VPC CIDR
         try:
             vpc_network = ipaddress.ip_network(state['cidr'])
@@ -516,6 +541,9 @@ class VPC:
                         print(f"  {Colors.RED}✗{Colors.RESET} {other_name} unreachable")
     @staticmethod
     def deploy_workload(vpc_name, subnet_name, port=8000):
+        if not Validators.validate_port(port):
+            return False
+    
         """Deploy a simple HTTP server in a subnet namespace"""
         manager = StateManager()
         state = manager.load(vpc_name)
@@ -652,7 +680,26 @@ class VPC:
             # Cleanup
             run_cmd(['ip', 'link', 'del', veth1], check=False)
             return False
-
+    @staticmethod
+    def cleanup_all():
+        """Clean up all VPCs - useful for testing"""
+        manager = StateManager()
+        vpcs = manager.list_all()
+        
+        if not vpcs:
+            log('INFO', "No VPCs to clean up")
+            return True
+        
+        log('INFO', f"Cleaning up {len(vpcs)} VPC(s)")
+        
+        for vpc_name in vpcs:
+            state = manager.load(vpc_name)
+            vpc = VPC(vpc_name, state['cidr'])
+            vpc.delete()
+        
+        log('SUCCESS', "All VPCs cleaned up")
+        return True
+    
 def main():
     if os.geteuid() != 0:
         log('ERROR', "This tool requires root privileges. Run with sudo.")
@@ -705,6 +752,8 @@ def main():
     policy_show_parser = subparsers.add_parser('policy-show', help='Show subnet firewall rules')
     policy_show_parser.add_argument('vpc_name', help='VPC name')
     policy_show_parser.add_argument('subnet_name', help='Subnet name')
+    
+    cleanup_parser = subparsers.add_parser('cleanup-all', help='Delete all VPCs')
     
     args = parser.parse_args()
     
@@ -760,6 +809,10 @@ def main():
 
         elif args.command == 'policy-show':
             PolicyManager.show_policy(args.vpc_name, args.subnet_name)
+            
+        elif args.command == 'cleanup-all':
+            success = VPC.cleanup_all()
+            sys.exit(0 if success else 1)
             
     except KeyboardInterrupt:
         print("\n\nOperation cancelled")
