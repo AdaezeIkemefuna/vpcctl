@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import sys
+sys.path.insert(0, '/usr/local/lib/python-vpcctl')
 
 import subprocess
 import json
@@ -7,6 +9,10 @@ import os
 import argparse
 from pathlib import Path
 import ipaddress
+
+from vpcctl_lib.state import StateManager, log, Colors
+from vpcctl_lib.policy import PolicyManager
+from vpcctl_lib.peering import PeeringManager
 
 STATE_DIR = Path("/var/lib/vpcctl")
 
@@ -687,6 +693,19 @@ def main():
     peer_parser.add_argument('vpc1', help='First VPC name')
     peer_parser.add_argument('vpc2', help='Second VPC name')
     
+    policy_apply_parser = subparsers.add_parser('policy-apply', help='Apply security policy to subnet')
+    policy_apply_parser.add_argument('vpc_name', help='VPC name')
+    policy_apply_parser.add_argument('subnet_name', help='Subnet name')
+    policy_apply_parser.add_argument('policy_file', help='Path to policy JSON file')
+
+    policy_clear_parser = subparsers.add_parser('policy-clear', help='Clear security policy from subnet')
+    policy_clear_parser.add_argument('vpc_name', help='VPC name')
+    policy_clear_parser.add_argument('subnet_name', help='Subnet name')
+
+    policy_show_parser = subparsers.add_parser('policy-show', help='Show subnet firewall rules')
+    policy_show_parser.add_argument('vpc_name', help='VPC name')
+    policy_show_parser.add_argument('subnet_name', help='Subnet name')
+    
     args = parser.parse_args()
     
     if not args.command:
@@ -728,8 +747,19 @@ def main():
             VPC.deploy_workload(args.vpc_name, args.subnet_name, args.port)
 
         elif args.command == 'peer':
-            success = VPC.peer(args.vpc1, args.vpc2)
+            success = PeeringManager.peer(args.vpc1, args.vpc2)
             sys.exit(0 if success else 1)
+
+        elif args.command == 'policy-apply':
+            success = PolicyManager.apply_policy(args.vpc_name, args.subnet_name, args.policy_file)
+            sys.exit(0 if success else 1)
+
+        elif args.command == 'policy-clear':
+            success = PolicyManager.clear_policy(args.vpc_name, args.subnet_name)
+            sys.exit(0 if success else 1)
+
+        elif args.command == 'policy-show':
+            PolicyManager.show_policy(args.vpc_name, args.subnet_name)
             
     except KeyboardInterrupt:
         print("\n\nOperation cancelled")
