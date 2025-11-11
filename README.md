@@ -1,63 +1,230 @@
 # vpcctl
 
-A simple VPC management tool using native Linux networking.
+A powerful Linux-native **VPC management tool** that lets you build isolated, cloud-style virtual networks locally — using only bridges, namespaces, and iptables.
 
-## What it does
+---
 
-Creates and manages Virtual Private Clouds (VPCs) on Linux using bridges and network namespaces. Each VPC gets its own isolated network with configurable CIDR blocks.
+## 🧭 Overview
 
-## Installation
+`vpcctl` creates and manages **Virtual Private Clouds (VPCs)** on Linux using:
+
+- Linux **bridges** for Layer 2 isolation
+- **network namespaces** for subnet environments
+- **iptables** for routing, NAT, and peering
+- **JSON-based persistent state** for VPC configuration
+
+It behaves much like AWS VPCs — but entirely locally.
+
+---
+
+## ✨ Features
+
+✅ Create isolated VPCs with custom CIDR blocks  
+✅ Add **private** or **public** subnets (with NAT)  
+✅ Persistent **state management** across reboots  
+✅ **Peering** between VPCs for inter-VPC communication  
+✅ Auto-recovery of bridges if missing  
+✅ Deploy simple **HTTP workloads** into namespaces  
+✅ Built-in **connectivity tests** (ping between subnets)  
+✅ Colored logging for readability  
+✅ Modular codebase (`vpcctl_lib` for state, policy, and peering logic)
+
+---
+
+## ⚙️ Installation
+
+### 1. Clone and install
 
 ```bash
-# Clone the repository
 git clone https://github.com/AdaezeIkemefuna/vpcctl.git
 cd vpcctl
-```
 
-### Quick run (from repo directory)
-
-```bash
-sudo python3 ./vpcctl create my-vpc 10.0.0.0/16
-```
-
-### Recommended: Install system-wide
-
-```bash
-# Copy script to system binaries
 sudo cp vpcctl /usr/local/bin/vpcctl
 sudo chmod +x /usr/local/bin/vpcctl
 
-# Create state directory
+# Copy supporting libraries
+sudo mkdir -p /usr/local/lib/python-vpcctl
+sudo cp -r vpcctl_lib /usr/local/lib/python-vpcctl/
+
+# Create persistent state directory
 sudo mkdir -p /var/lib/vpcctl
 ```
 
 **Why these locations?**
 
-- `/usr/local/bin` - Makes `vpcctl` available from anywhere in your terminal (it's in your `$PATH`)
-- `/var/lib/vpcctl` - Stores VPC state persistently. This is where vpcctl remembers your VPC configurations across reboots.
+| Path                           | Purpose                                |
+| ------------------------------ | -------------------------------------- |
+| `/usr/local/bin`               | Allows running `vpcctl` from anywhere  |
+| `/usr/local/lib/python-vpcctl` | Houses internal Python library modules |
+| `/var/lib/vpcctl`              | Stores VPC state as JSON files         |
 
 ## Usage
 
+### 🏗️ Create a VPC
+
 ```bash
-# Create a VPC
-sudo vpcctl create demo-vpc 10.0.0.0/16
-
-# List all VPCs
-sudo vpcctl list
-
-# Show VPC details
-sudo vpcctl show demo-vpc
-
-# Delete a VPC
-sudo vpcctl del demo-vpc
+sudo vpcctl create my-vpc 10.0.0.0/16
 ```
 
-## Requirements
+### ➕ Add a Subnet
+
+```bash
+sudo vpcctl subnet-add my-vpc subnet-a 10.0.1.0/24 private
+sudo vpcctl subnet-add my-vpc public-subnet 10.0.2.0/24 public
+```
+
+- Private subnets are isolated.
+- Public subnets get NAT to the internet automatically.
+
+### 🌐 List All VPCs
+
+```bash
+sudo vpcctl list
+```
+
+### 🔍 Show VPC Details
+
+```bash
+sudo vpcctl show my-vpc
+```
+
+### 🧹 Delete a VPC
+
+```bash
+sudo vpcctl del my-vpc
+```
+
+- Cleans up namespaces, bridges, NAT, and peerings automatically.
+
+### 🔄 Test Connectivity
+
+Run built-in connectivity tests inside VPC namespaces:
+
+```bash
+sudo vpcctl test my-vpc
+```
+
+You can also test a specific subnet:
+
+```bash
+sudo vpcctl test my-vpc subnet-a
+```
+
+## 🚀 Deploy Workload (Demo Web Server)
+
+Start a simple HTTP server inside a subnet namespace:
+
+```bash
+sudo vpcctl deploy-workload my-vpc subnet-a --port 8080
+```
+
+Then test it from the host:
+
+```bash
+curl http://10.0.1.2:8080
+```
+
+## 🔗 Peering Between VPCs
+
+Connect two VPCs so their subnets can communicate:
+
+```bash
+sudo vpcctl peer vpc-a vpc-b
+```
+
+This:
+
+- Creates a veth pair between both bridges
+- Sets up forwarding rules in iptables
+- Adds routes in all subnet namespaces
+
+## 🧩 Example Workflow
+
+# Create two VPCs
+
+```bash
+sudo vpcctl create vpc-a 10.0.0.0/16
+sudo vpcctl create vpc-b 10.1.0.0/16
+```
+
+# Add subnets
+
+```bash
+sudo vpcctl subnet-add vpc-a subnet-a1 10.0.1.0/24 private
+sudo vpcctl subnet-add vpc-b subnet-b1 10.1.1.0/24 public
+```
+
+# Peer them
+
+```bash
+sudo vpcctl peer vpc-a vpc-b
+```
+
+# Test connectivity between namespaces
+
+```bash
+sudo vpcctl test vpc-a
+sudo vpcctl test vpc-b
+```
+
+# Deploy workloads
+
+```bash
+sudo vpcctl deploy-workload vpc-a subnet-a1
+sudo vpcctl deploy-workload vpc-b subnet-b1
+```
+
+## 🧱 Requirements
 
 - Linux with `ip` command (iproute2)
 - Python 3.6+
 - Root privileges (sudo)
 
-## State Storage
+## 📦 State Storage
 
-VPC configurations are stored as JSON files in `/var/lib/vpcctl/`. Each VPC gets its own state file containing bridge name, CIDR, gateway IP, and subnet information.
+All persistent configuration is stored in `/var/lib/vpcctl/` as JSON files.
+
+### Example
+
+```bash
+
+{
+  "name": "demo-vpc",
+  "cidr": "10.0.0.0/16",
+  "bridge": "br-demo-vpc",
+  "subnets": {
+    "subnet-a": {
+      "cidr": "10.0.1.0/24",
+      "type": "private",
+      "namespace": "ns-demo-vpc-subnet-a",
+      "gateway_ip": "10.0.1.1",
+      "namespace_ip": "10.0.1.2"
+    },
+  },
+  "peerings": {}
+}
+
+```
+
+## 🧩 Internal Structure
+
+| Module                  | Purpose                                        |
+| ----------------------- | ---------------------------------------------- |
+| `vpcctl`                | CLI entrypoint and orchestration               |
+| `vpcctl_lib/state.py`   | Handles persistent VPC state management        |
+| `vpcctl_lib/policy.py`  | Policy and security rule management _(future)_ |
+| `vpcctl_lib/peering.py` | VPC peering and routing setup                  |
+
+## 🧰 Command Reference
+
+| Command                                                | Description                            |                   |
+| ------------------------------------------------------ | -------------------------------------- | ----------------- |
+| `vpcctl create <vpc-name> <cidr>`                      | Create a new VPC                       |                   |
+| `vpcctl subnet-add <vpc> <subnet-name> <cidr> <private | public>`                               | Add subnet to VPC |
+| `vpcctl list`                                          | List all VPCs                          |                   |
+| `vpcctl show <vpc>`                                    | Show details of a VPC                  |                   |
+| `vpcctl del <vpc>`                                     | Delete a VPC                           |                   |
+| `vpcctl test <vpc> [subnet]`                           | Test connectivity inside VPC or subnet |                   |
+| `vpcctl peer <vpc-a> <vpc-b>`                          | Create peering between VPCs            |                   |
+| `vpcctl deploy-workload <vpc> <subnet> [--port N]`     | Deploy demo HTTP server in subnet      |                   |
+| `vpcctl --help`                                        | Show help message                      |                   |
