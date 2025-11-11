@@ -217,14 +217,116 @@ All persistent configuration is stored in `/var/lib/vpcctl/` as JSON files.
 
 ## 🧰 Command Reference
 
-| Command                                                | Description                            |                   |
-| ------------------------------------------------------ | -------------------------------------- | ----------------- |
-| `vpcctl create <vpc-name> <cidr>`                      | Create a new VPC                       |                   |
-| `vpcctl subnet-add <vpc> <subnet-name> <cidr> <private | public>`                               | Add subnet to VPC |
-| `vpcctl list`                                          | List all VPCs                          |                   |
-| `vpcctl show <vpc>`                                    | Show details of a VPC                  |                   |
-| `vpcctl del <vpc>`                                     | Delete a VPC                           |                   |
-| `vpcctl test <vpc> [subnet]`                           | Test connectivity inside VPC or subnet |                   |
-| `vpcctl peer <vpc-a> <vpc-b>`                          | Create peering between VPCs            |                   |
-| `vpcctl deploy-workload <vpc> <subnet> [--port N]`     | Deploy demo HTTP server in subnet      |                   |
-| `vpcctl --help`                                        | Show help message                      |                   |
+| Command                                            | Description                            |     |
+| -------------------------------------------------- | -------------------------------------- | --- |
+| `vpcctl create <vpc-name> <cidr>`                  | Create a new VPC                       |     |
+| `vpcctl subnet-add <vpc> <subnet-name> <cidr>`     | Add subnet to VPC                      |     |
+| `vpcctl list`                                      | List all VPCs                          |     |
+| `vpcctl show <vpc>`                                | Show details of a VPC                  |     |
+| `vpcctl del <vpc>`                                 | Delete a VPC                           |     |
+| `vpcctl test <vpc> [subnet]`                       | Test connectivity inside VPC or subnet |     |
+| `vpcctl peer <vpc-a> <vpc-b>`                      | Create peering between VPCs            |     |
+| `vpcctl deploy-workload <vpc> <subnet> [--port N]` | Deploy demo HTTP server in subnet      |     |
+| `vpcctl --help`                                    | Show help message                      |     |
+
+## 🎬 Quick Demo
+
+Run the automated demo script to see all features in action:
+
+```bash
+sudo bash demo.sh
+```
+
+This demo:
+
+- Creates two VPCs with public/private subnets
+- Deploys web applications in each subnet
+- Tests inter-subnet communication
+- Demonstrates NAT gateway functionality
+- Shows VPC isolation and peering
+- Applies and tests security policies
+- Performs complete cleanup
+
+Perfect for presentations or verification!
+
+🧪 Testing & Validation
+Manual Testing
+
+```bash
+# Test inter-subnet communication
+sudo ip netns exec ns-vpc1-public ping 10.1.2.2
+
+
+# Test internet access (public subnet)
+sudo ip netns exec ns-vpc1-public ping 8.8.8.8
+
+# Test deployed application
+curl http://10.1.1.2:8001
+```
+
+Automated Testing with Makefile
+
+```bash
+make test       # Run basic functionality tests
+sudo make demo       # Run full demo scenario with root privileges
+make clean      # Remove all VPCs
+```
+
+## 🔒 Security Policies
+
+Apply firewall rules to subnets using JSON policy files:
+
+```bash
+# Create policy file
+cat > web-policy.json << 'EOF'
+{
+  "subnet": "10.1.1.0/24",
+  "ingress": [
+    {"port": 80, "protocol": "tcp", "source": "0.0.0.0/0", "action": "allow"},
+    {"port": 8001, "protocol": "tcp", "source": "10.1.0.0/16", "action": "allow"},
+    {"port": 22, "protocol": "tcp", "source": "0.0.0.0/0", "action": "deny"}
+  ]
+}
+EOF
+
+# Apply policy
+sudo vpcctl policy-apply vpc1 public web-policy.json
+
+# View active rules
+sudo vpcctl policy-show vpc1 public
+
+# Clear policy
+sudo vpcctl policy-clear vpc1 public
+```
+
+Policy features:
+
+- Default deny with explicit allows
+- Source IP/CIDR filtering
+- Port and protocol-specific rules
+- Supports both ingress and egress rules
+
+## 🧹 Cleanup
+
+Clean up specific VPC
+
+```bash
+sudo vpcctl del my-vpc
+```
+
+Clean up all VPCs
+
+```bash
+sudo vpcctl cleanup-all
+```
+
+## 🛠️ Makefile Commands
+
+```bash
+make install    # Install vpcctl system-wide
+make uninstall  # Remove vpcctl from system
+make test       # Run basic functionality tests
+make clean      # Remove all VPCs
+make demo       # Run full demo scenario
+make help       # Show all available commands
+```
