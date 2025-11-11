@@ -1,0 +1,560 @@
+#!/usr/bin/env python3
+
+import subprocess
+import json
+import sys
+import os
+import argparse
+from pathlib import Path
+import ipaddress
+
+STATE_DIR = Path("/var/lib/vpcctl")
+
+class Colors:
+    GREEN = '\033[92m'
+    BLUE = '\033[94m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    RESET = '\033[0m'
+
+def log(level, message):
+    colors = {'INFO': Colors.BLUE, 'SUCCESS': Colors.GREEN, 
+              'WARNING': Colors.YELLOW, 'ERROR': Colors.RED}
+    color = colors.get(level, '')
+    print(f"{color}[{level}]{Colors.RESET} {message}")
+
+def run_cmd(cmd, check=True):
+    try:
+        log('INFO', f"Running: {' '.join(cmd)}")
+        result = subprocess.run(cmd, check=check, capture_output=True, text=True)
+        return result.returncode == 0
+    except subprocess.CalledProcessError as e:
+        log('ERROR', f"Command failed: {e.stderr}")
+        if check:
+            raise
+        return False
+
+def check_bridge_exists(bridge_name):
+    """Check if a bridge interface exists"""
+    try:
+        result = subprocess.run(['ip', 'link', 'show', bridge_name], 
+                              capture_output=True, text=True, check=False)
+        return result.returncode == 0
+    except:
+        return False
+
+class StateManager:
+    def __init__(self):
+        self.state_dir = STATE_DIR
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+    
+    def save(self, vpc_name, data):
+        state_file = self.state_dir / f"{vpc_name}.json"
+        with open(state_file, 'w') as f:
+            json.dump(data, f, indent=2)
+        log('SUCCESS', f"State saved: {state_file}")
+    
+    def load(self, vpc_name):
+        state_file = self.state_dir / f"{vpc_name}.json"
+        if not state_file.exists():
+            return None
+        with open(state_file, 'r') as f:
+            return json.load(f)
+    
+    def delete(self, vpc_name):
+        state_file = self.state_dir / f"{vpc_name}.json"
+        if state_file.exists():
+            state_file.unlink()
+            log('SUCCESS', f"State deleted: {state_file}")
+    
+    def exists(self, vpc_name):
+        return (self.state_dir / f"{vpc_name}.json").exists()
+    
+    def list_all(self):
+        return [f.stem for f in self.state_dir.glob("*.json")]
+
+class VPC:
+    def __init__(self, name, cidr):
+        self.name = name
+        self.cidr = cidr
+        self.bridge_name = f"br-{name}"
+        self.state_manager = StateManager()
+    
+    def create(self):
+        log('INFO', f"Creating VPC: {self.name} ({self.cidr})")
+        
+        if self.state_manager.exists(self.name):
+            log('ERROR', f"VPC {self.name} already exists")
+            return False
+        
+        try:
+            # Check if bridge already exists
+            if check_bridge_exists(self.bridge_name):
+                log('WARNING', f"Bridge {self.bridge_name} already exists, deleting it")
+                run_cmd(['ip', 'link', 'del', self.bridge_name], check=False)
+            
+            log('INFO', f"Creating bridge: {self.bridge_name}")
+            run_cmd(['ip', 'link', 'add', 'name', self.bridge_name, 'type', 'bridge'])
+            
+            # Don't assign an IP to the bridge yet - we'll do it when subnets are added
+            log('INFO', "Bringing bridge UP")
+            run_cmd(['ip', 'link', 'set', self.bridge_name, 'up'])
+            
+            state_data = {
+                'name': self.name,
+                'cidr': self.cidr,
+                'bridge': self.bridge_name,
+                'subnets': {}
+            }
+            self.state_manager.save(self.name, state_data)
+            
+            log('SUCCESS', f"VPC {self.name} created successfully!")
+            log('INFO', f"  Bridge: {self.bridge_name}")
+            log('INFO', f"  CIDR: {self.cidr}")
+            
+            return True
+            
+        except Exception as e:
+            log('ERROR', f"Failed to create VPC: {e}")
+            run_cmd(['ip', 'link', 'del', self.bridge_name], check=False)
+            return False
+    
+    def recreate_bridge(self, state):
+        """Recreate a bridge from state if it doesn't exist"""
+        log('WARNING', f"Bridge {state['bridge']} not found, recreating from state")
+        
+        try:
+            # Create the bridge
+            run_cmd(['ip', 'link', 'add', 'name', state['bridge'], 'type', 'bridge'])
+            
+            # Bring it up
+            run_cmd(['ip', 'link', 'set', state['bridge'], 'up'])
+            
+            # Re-add IPs for existing subnets
+            for subnet_name, subnet_data in state['subnets'].items():
+                gateway_ip = subnet_data.get('gateway_ip')
+                if gateway_ip:
+                    subnet_prefix = subnet_data['cidr'].split('/')[1]
+                    log('INFO', f"Re-adding gateway IP for subnet {subnet_name}: {gateway_ip}/{subnet_prefix}")
+                    run_cmd(['ip', 'addr', 'add', f"{gateway_ip}/{subnet_prefix}", 
+                            'dev', state['bridge']], check=False)
+            
+            log('SUCCESS', f"Bridge {state['bridge']} recreated successfully")
+            return True
+            
+        except Exception as e:
+            log('ERROR', f"Failed to recreate bridge: {e}")
+            return False
+    
+    def delete(self):
+        log('INFO', f"Deleting VPC: {self.name}")
+        
+        state = self.state_manager.load(self.name)
+        if not state:
+            log('WARNING', f"VPC {self.name} does not exist")
+            return False
+        
+        try:
+            # Delete all subnets first
+            for subnet_name, subnet_data in state['subnets'].items():
+                log('INFO', f"Deleting subnet: {subnet_name}")
+                
+                # Remove NAT rules if public subnet
+                if subnet_data.get('type') == 'public':
+                    log('INFO', f"Removing NAT rules for {subnet_name}")
+                    internet_iface = self._get_internet_interface()
+                    if internet_iface:
+                        run_cmd(['iptables', '-t', 'nat', '-D', 'POSTROUTING', 
+                                '-s', subnet_data['cidr'], '-o', internet_iface, 
+                                '-j', 'MASQUERADE'], check=False)
+                
+                run_cmd(['ip', 'netns', 'del', subnet_data['namespace']], check=False)
+                run_cmd(['ip', 'link', 'del', subnet_data['veth_br']], check=False)
+
+            # Delete the bridge
+            log('INFO', f"Deleting bridge: {state['bridge']}")
+            run_cmd(['ip', 'link', 'del', state['bridge']], check=False)
+            
+            # Remove state
+            self.state_manager.delete(self.name)
+            
+            log('SUCCESS', f"VPC {self.name} deleted successfully!")
+            return True
+            
+        except Exception as e:
+            log('ERROR', f"Failed to delete VPC: {e}")
+            return False
+
+    def subnet_add(self, subnet_name, subnet_cidr, subnet_type='private'):
+        log('INFO', f"Adding subnet {subnet_name} ({subnet_cidr}) to VPC {self.name}")
+
+        state = self.state_manager.load(self.name)
+        if not state:
+            log('ERROR', f"VPC {self.name} does not exist")
+            return False
+        
+        if subnet_name in state['subnets']:
+            log('ERROR', f"Subnet {subnet_name} already exists in VPC {self.name}")
+            return False
+
+        # Validate that subnet is within VPC CIDR
+        try:
+            vpc_network = ipaddress.ip_network(state['cidr'])
+            subnet_network = ipaddress.ip_network(subnet_cidr)
+            
+            if not subnet_network.subnet_of(vpc_network):
+                log('ERROR', f"Subnet {subnet_cidr} is not within VPC CIDR {state['cidr']}")
+                return False
+        except Exception as e:
+            log('ERROR', f"Invalid CIDR format: {e}")
+            return False
+
+        # Check if bridge exists, recreate if needed
+        if not check_bridge_exists(state['bridge']):
+            log('WARNING', f"Bridge {state['bridge']} does not exist")
+            if not self.recreate_bridge(state):
+                log('ERROR', f"Cannot proceed without bridge {state['bridge']}")
+                return False
+
+        try:
+            ns_name = f"ns-{self.name}-{subnet_name}"
+            veth_br = f"veth-{subnet_name}-br"
+            veth_ns = f"veth-{subnet_name}-ns"
+
+            # Get gateway IP (first usable IP in subnet)
+            subnet_net = ipaddress.ip_network(subnet_cidr)
+            gateway_ip = str(list(subnet_net.hosts())[0])  # First usable IP
+            namespace_ip = str(list(subnet_net.hosts())[1])  # Second usable IP
+            subnet_prefix = subnet_cidr.split('/')[1]
+
+            # Add gateway IP to the bridge for this subnet
+            log('INFO', f"Adding gateway IP {gateway_ip}/{subnet_prefix} to bridge")
+            run_cmd(['ip', 'addr', 'add', f"{gateway_ip}/{subnet_prefix}", 
+                    'dev', state['bridge']], check=False)  # check=False in case IP already exists
+
+
+
+            # Create namespace
+            log('INFO', f"Creating namespace: {ns_name}")
+            run_cmd(['ip', 'netns', 'add', ns_name])
+
+            # Create veth pair
+            log('INFO', f"Creating veth pair: {veth_br} <-> {veth_ns}")
+            run_cmd(['ip', 'link', 'add', veth_br, 'type', 'veth', 'peer', 'name', veth_ns])
+            
+            # Move one end to namespace
+            log('INFO', f"Moving {veth_ns} to namespace {ns_name}")
+            run_cmd(['ip', 'link', 'set', veth_ns, 'netns', ns_name])
+            
+            # Attach the other end to bridge
+            log('INFO', f"Attaching {veth_br} to bridge {state['bridge']}")
+            run_cmd(['ip', 'link', 'set', veth_br, 'master', state['bridge']])
+            run_cmd(['ip', 'link', 'set', veth_br, 'up'])
+            
+            # Configure namespace interface
+            log('INFO', f"Configuring namespace interface with IP {namespace_ip}/{subnet_prefix}")
+            run_cmd(['ip', 'netns', 'exec', ns_name, 'ip', 'addr', 'add', 
+                    f"{namespace_ip}/{subnet_prefix}", 'dev', veth_ns])
+            run_cmd(['ip', 'netns', 'exec', ns_name, 'ip', 'link', 'set', veth_ns, 'up'])
+            run_cmd(['ip', 'netns', 'exec', ns_name, 'ip', 'link', 'set', 'lo', 'up'])
+
+            # Add default route - now the gateway is in the same subnet
+            log('INFO', f"Adding default route via {gateway_ip}")
+            run_cmd(['ip', 'netns', 'exec', ns_name, 'ip', 'route', 'add', 
+                    'default', 'via', gateway_ip])
+
+            # Enable IP forwarding on the host (if not already enabled)
+            log('INFO', "Enabling IP forwarding")
+            run_cmd(['sysctl', '-w', 'net.ipv4.ip_forward=1'], check=False)
+
+            if subnet_type == 'public':
+                log('INFO', f"Configuring NAT for public subnet")
+                self._enable_nat(subnet_cidr)
+
+            # Update state
+            state['subnets'][subnet_name] = {
+                'cidr': subnet_cidr,
+                'namespace': ns_name,
+                'veth_br': veth_br,
+                'veth_ns': veth_ns,
+                'gateway_ip': gateway_ip,
+                'namespace_ip': namespace_ip,
+                'type': subnet_type
+            }
+
+            self.state_manager.save(self.name, state)
+            
+            log('SUCCESS', f"Subnet {subnet_name} added to VPC {self.name}")
+            log('INFO', f"  Namespace: {ns_name}")
+            log('INFO', f"  Gateway IP: {gateway_ip}")
+            log('INFO', f"  Namespace IP: {namespace_ip}")
+            
+            # Test connectivity
+            log('INFO', "Testing connectivity...")
+            test_result = subprocess.run(
+                ['ip', 'netns', 'exec', ns_name, 'ping', '-c', '1', '-W', '1', gateway_ip],
+                capture_output=True, check=False
+            )
+            if test_result.returncode == 0:
+                log('SUCCESS', "Connectivity test passed - namespace can reach gateway")
+            else:
+                log('WARNING', "Connectivity test failed - check firewall rules")
+            
+            return True
+
+        except Exception as e:
+            log('ERROR', f"Failed to add subnet: {e}")
+            # Cleanup on failure
+            run_cmd(['ip', 'netns', 'del', ns_name], check=False)
+            run_cmd(['ip', 'link', 'del', veth_br], check=False)
+            return False
+        
+    def _get_prefix(self):
+        """Get CIDR prefix length"""
+        return self.cidr.split('/')[1]
+    
+    def _enable_nat(self, subnet_cidr):
+        """Enable NAT for a subnet"""
+        internet_iface = self._get_internet_interface()
+        if not internet_iface:
+            log('WARNING', "Could not determine internet interface, NAT may not work")
+            return
+    
+        log('INFO', f"Setting up NAT via interface {internet_iface}")
+        
+        # Add MASQUERADE rule for this subnet
+        run_cmd(['iptables', '-t', 'nat', '-A', 'POSTROUTING', 
+                '-s', subnet_cidr, '-o', internet_iface, '-j', 'MASQUERADE'], 
+                check=False)
+        
+        # Allow forwarding from bridge to internet interface
+        run_cmd(['iptables', '-A', 'FORWARD', '-i', self.bridge_name, 
+                '-o', internet_iface, '-j', 'ACCEPT'], check=False)
+        
+        # Allow return traffic
+        run_cmd(['iptables', '-A', 'FORWARD', '-i', internet_iface, 
+                '-o', self.bridge_name, '-m', 'state', '--state', 
+                'RELATED,ESTABLISHED', '-j', 'ACCEPT'], check=False)
+
+    def _get_internet_interface(self):
+        """Get the default network interface for internet access"""
+        try:
+            result = subprocess.run(['ip', 'route', 'show', 'default'], 
+                                capture_output=True, text=True)
+            if result.returncode == 0:
+                parts = result.stdout.split()
+                if 'dev' in parts:
+                    return parts[parts.index('dev') + 1]
+        except:
+            pass
+        return None
+    
+    @staticmethod
+    def list_all():
+        manager = StateManager()
+        vpcs = manager.list_all()
+        
+        if not vpcs:
+            log('INFO', "No VPCs found")
+            return
+        
+        print(f"\n{'='*60}")
+        print("Existing VPCs:")
+        print(f"{'='*60}")
+        
+        for vpc_name in vpcs:
+            state = manager.load(vpc_name)
+            print(f"\n  {Colors.GREEN}•{Colors.RESET} {vpc_name}")
+            print(f"    CIDR: {state['cidr']}")
+            print(f"    Bridge: {state['bridge']}")
+            
+            # Check if bridge actually exists
+            if not check_bridge_exists(state['bridge']):
+                print(f"    {Colors.YELLOW}⚠ Bridge missing (will be recreated on next operation){Colors.RESET}")
+            
+            print(f"    Subnets: {len(state['subnets'])}")
+            
+            if state['subnets']:
+                for name, subnet in state['subnets'].items():
+                    print(f"      • {name} ({subnet['cidr']})")
+                    if 'gateway_ip' in subnet:
+                        print(f"        Gateway: {subnet['gateway_ip']}")
+                    if 'namespace_ip' in subnet:
+                        print(f"        Namespace IP: {subnet['namespace_ip']}")
+        
+        print()
+    
+    @staticmethod
+    def show(vpc_name):
+        manager = StateManager()
+        state = manager.load(vpc_name)
+        
+        if not state:
+            log('ERROR', f"VPC {vpc_name} not found")
+            return
+        
+        print(f"\n{'='*60}")
+        print(f"VPC: {state['name']}")
+        print(f"{'='*60}")
+        print(f"CIDR:    {state['cidr']}")
+        print(f"Bridge:  {state['bridge']}")
+        
+        # Check if bridge actually exists
+        if not check_bridge_exists(state['bridge']):
+            print(f"{Colors.YELLOW}⚠ Note: Bridge is missing and will be recreated on next operation{Colors.RESET}")
+        
+        print(f"\nSubnets: {len(state['subnets'])}")
+        
+        if state['subnets']:
+            for name, subnet in state['subnets'].items():
+                subnet_type = subnet.get('type', 'private')
+                print(f"\n  • {name} ({subnet_type})")
+                print(f"    CIDR: {subnet['cidr']}")
+                print(f"    Namespace: {subnet['namespace']}")
+                if 'gateway_ip' in subnet:
+                    print(f"    Gateway IP: {subnet['gateway_ip']}")
+                if 'namespace_ip' in subnet:
+                    print(f"    Namespace IP: {subnet['namespace_ip']}")
+                print(f"    Veth Bridge Side: {subnet['veth_br']}")
+                print(f"    Veth Namespace Side: {subnet['veth_ns']}")
+        
+        print()
+
+    @staticmethod
+    def test(vpc_name, subnet_name=None):
+        """Test connectivity within VPC"""
+        manager = StateManager()
+        state = manager.load(vpc_name)
+        
+        if not state:
+            log('ERROR', f"VPC {vpc_name} not found")
+            return
+        
+        if not state['subnets']:
+            log('WARNING', f"No subnets in VPC {vpc_name}")
+            return
+        
+        if subnet_name:
+            if subnet_name not in state['subnets']:
+                log('ERROR', f"Subnet {subnet_name} not found in VPC {vpc_name}")
+                return
+            subnets_to_test = {subnet_name: state['subnets'][subnet_name]}
+        else:
+            subnets_to_test = state['subnets']
+        
+        print(f"\n{'='*60}")
+        print(f"Testing connectivity in VPC: {vpc_name}")
+        print(f"{'='*60}")
+        
+        for name, subnet in subnets_to_test.items():
+            print(f"\n• Testing subnet: {name}")
+            ns_name = subnet['namespace']
+            
+            # Test gateway connectivity
+            if 'gateway_ip' in subnet:
+                gateway_ip = subnet['gateway_ip']
+                print(f"  Testing connectivity to gateway ({gateway_ip})...")
+                
+                result = subprocess.run(
+                    ['ip', 'netns', 'exec', ns_name, 'ping', '-c', '2', '-W', '1', gateway_ip],
+                    capture_output=True, check=False
+                )
+                
+                if result.returncode == 0:
+                    print(f"  {Colors.GREEN}✓{Colors.RESET} Gateway reachable")
+                else:
+                    print(f"  {Colors.RED}✗{Colors.RESET} Gateway unreachable")
+            
+            # Test inter-subnet connectivity
+            for other_name, other_subnet in state['subnets'].items():
+                if other_name != name and 'namespace_ip' in other_subnet:
+                    other_ip = other_subnet['namespace_ip']
+                    print(f"  Testing connectivity to {other_name} ({other_ip})...")
+                    
+                    result = subprocess.run(
+                        ['ip', 'netns', 'exec', ns_name, 'ping', '-c', '2', '-W', '1', other_ip],
+                        capture_output=True, check=False
+                    )
+                    
+                    if result.returncode == 0:
+                        print(f"  {Colors.GREEN}✓{Colors.RESET} {other_name} reachable")
+                    else:
+                        print(f"  {Colors.RED}✗{Colors.RESET} {other_name} unreachable")
+
+def main():
+    if os.geteuid() != 0:
+        log('ERROR', "This tool requires root privileges. Run with sudo.")
+        sys.exit(1)
+    
+    parser = argparse.ArgumentParser(prog='vpcctl', description='VPC Management Tool')
+    subparsers = parser.add_subparsers(dest='command', help='Available commands')
+    
+    create_parser = subparsers.add_parser('create', help='Create a new VPC')
+    create_parser.add_argument('name', help='VPC name')
+    create_parser.add_argument('cidr', help='CIDR block (e.g., 10.0.0.0/16)')
+    
+    delete_parser = subparsers.add_parser('del', help='Delete a VPC')
+    delete_parser.add_argument('name', help='VPC name')
+    
+    list_parser = subparsers.add_parser('list', help='List all VPCs')
+    
+    show_parser = subparsers.add_parser('show', help='Show VPC details')
+    show_parser.add_argument('name', help='VPC name')
+
+    subnet_add_parser = subparsers.add_parser('subnet-add', help='Add subnet to VPC')
+    subnet_add_parser.add_argument('vpc_name', help='VPC name')
+    subnet_add_parser.add_argument('subnet_name', help='Subnet name (e.g., public, private)')
+    subnet_add_parser.add_argument('subnet_cidr', help='Subnet CIDR (e.g., 10.0.1.0/24)')
+    subnet_add_parser.add_argument('--type', choices=['public', 'private'], 
+                               default='private', help='Subnet type')
+    
+    test_parser = subparsers.add_parser('test', help='Test VPC connectivity')
+    test_parser.add_argument('vpc_name', help='VPC name')
+    test_parser.add_argument('subnet_name', nargs='?', help='Optional: specific subnet to test')
+    
+    args = parser.parse_args()
+    
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+    
+    try:
+        if args.command == 'create':
+            vpc = VPC(args.name, args.cidr)
+            success = vpc.create()
+            sys.exit(0 if success else 1)
+        
+        elif args.command == 'del':
+            vpc = VPC(args.name, '')
+            success = vpc.delete()
+            sys.exit(0 if success else 1)
+        
+        elif args.command == 'list':
+            VPC.list_all()
+        
+        elif args.command == 'show':
+            VPC.show(args.name)
+
+        elif args.command == 'subnet-add':
+            # Load the VPC state to get its CIDR
+            manager = StateManager()
+            state = manager.load(args.vpc_name)
+            if state:
+                vpc = VPC(args.vpc_name, state['cidr'])
+            else:
+                vpc = VPC(args.vpc_name, '')
+            success = vpc.subnet_add(args.subnet_name, args.subnet_cidr, args.type)
+            sys.exit(0 if success else 1)
+        
+        elif args.command == 'test':
+            VPC.test(args.vpc_name, args.subnet_name)
+        
+    except KeyboardInterrupt:
+        print("\n\nOperation cancelled")
+        sys.exit(1)
+    except Exception as e:
+        log('ERROR', f"Unexpected error: {e}")
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()
